@@ -14,6 +14,9 @@ import sys
 import time
 import zlib
 
+# XPath for Subversion log parsing
+import libxml2
+
 GNUPLOT_COMMON = 'set terminal png transparent\nset size 1.0,0.5\n'
 ON_LINUX = (platform.system() == 'Linux')
 WEEKDAYS = ('Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun')
@@ -36,6 +39,8 @@ conf = {
 	'authors_top': 5,
 	'commit_begin': '',
 	'commit_end': '',
+	'commit_end': '',
+	'vcs' : 'git',
 }
 
 def getpipeoutput(cmds, quiet = False):
@@ -63,6 +68,14 @@ def getcommitrange(defaultrange = '', end_only = False):
 		if end_only or len(conf['commit_begin']) == 0:
 			return conf['commit_end']
 		return '%s..%s' % (conf['commit_begin'], conf['commit_end'])
+	return defaultrange
+
+# used for svn commitrange
+def getSVNcommitrange(defaultrange = '', end_only = False):
+	if len(conf['commit_end']) > 0:
+		if end_only or len(conf['commit_begin']) == 0:
+			return conf['commit_end']
+		return '%s:%s' % (conf['commit_begin'], conf['commit_end'])
 	return defaultrange
 
 def getkeyssortedbyvalues(dict):
@@ -165,12 +178,29 @@ class DataCollector:
 		f.write(data)
 		f.close()
 
-class GitDataCollector(DataCollector):
-	def collect(self, dir):
+class RepoDataCollector(DataCollector):
+	def collect(self, dir, vcs):
+
+		# parse svn xml log if vcs == 'svn'
+		if vcs == 'svn':
+			if(getSVNcommitrange()):
+				svn_xml_log_text = getpipeoutput(['svn log --xml -v -r %s' % getSVNcommitrange()])
+			else:
+				svn_xml_log_text = getpipeoutput(['svn log --xml -v'])
+			svn_xml_log_parsed = libxml2.parseDoc(svn_xml_log_text)
+			svn_xml_log = svn_xml_log_parsed.xpathNewContext()
+
 		DataCollector.collect(self, dir)
 
 		try:
-			self.total_authors = int(getpipeoutput(['git shortlog -s %s' % getcommitrange(), 'wc -l']))
+			if vcs == 'svn':
+				svn_authors_list = set()
+				svn_authors_list_xml = svn_xml_log.xpathEval('//author')
+				for node in svn_authors_list_xml:
+					svn_authors_list.add(node.content)
+				self.total_authors = len(svn_authors_list)
+			else:
+				self.total_authors = int(getpipeoutput(['git shortlog -s %s' % getcommitrange(), 'wc -l']))
 		except:
 			self.total_authors = 0
 		#self.total_lines = int(getoutput('git-ls-files -z |xargs -0 cat |wc -l'))
@@ -209,59 +239,121 @@ class GitDataCollector(DataCollector):
 
 		# tags
 		self.tags = {}
-		lines = getpipeoutput(['git show-ref --tags']).split('\n')
-		for line in lines:
-			if len(line) == 0:
-				continue
-			(hash, tag) = line.split(' ')
+			
+		if vcs == 'svn':
+			try:
+				tags = os.listdir("tags")
+			except:
+				print "No tags directory at all"
+				tags = []
+			try:
+				tags.remove(".svn")
+			except ValueError:
+				print "There should be a .svn in tags directory, but there's not. Anyway, let's get it started."
 
-			tag = tag.replace('refs/tags/', '')
-			output = getpipeoutput(['git log "%s" --pretty=format:"%%at %%aN" -n 1' % hash])
-			if len(output) > 0:
-				parts = output.split(' ')
-				stamp = 0
-				try:
-					stamp = int(parts[0])
-				except ValueError:
+			# creating tags for manipulations
+			svn_tags_xml_log_text = {}
+			svn_tags_xml_log_parsed = {}
+			svn_tags_xml_log = {}
+			
+			for tag in tags:
+				svn_tags_xml_log_text[tag] = getpipeoutput(['svn log --xml tags/%s' % tag])
+				svn_tags_xml_log_parsed[tag] = libxml2.parseDoc(svn_tags_xml_log_text[tag])
+				svn_tags_xml_log[tag] = svn_tags_xml_log_parsed[tag].xpathNewContext()
+				
+
+			for tag in tags:
+				# hash == revision in svn world
+				hash = svn_tags_xml_log[tag].xpathEval("//logentry")[0].prop("revision")
+				# timestamp conversion from rfc3339
+				timestamp = datetime.datetime.strptime(svn_tags_xml_log[tag].xpathEval("//date")[0].content, "%Y-%m-%dT%H:%M:%S.%fZ")
+
+				self.tags[tag] = { 'stamp': float(timestamp.strftime("%s")), 'hash' : hash, 'date' : timestamp.strftime('%Y-%m-%d'), 'commits': 0, 'authors': {} }
+
+
+		else:
+			lines = getpipeoutput(['git show-ref --tags']).split('\n')
+			for line in lines:
+				if len(line) == 0:
+					continue
+				(hash, tag) = line.split(' ')
+
+				tag = tag.replace('refs/tags/', '')
+				output = getpipeoutput(['git log "%s" --pretty=format:"%%at %%aN" -n 1' % hash])
+				if len(output) > 0:
+					parts = output.split(' ')
 					stamp = 0
-				self.tags[tag] = { 'stamp': stamp, 'hash' : hash, 'date' : datetime.datetime.fromtimestamp(stamp).strftime('%Y-%m-%d'), 'commits': 0, 'authors': {} }
+					try:
+						stamp = int(parts[0])
+					except ValueError:
+						stamp = 0
+					self.tags[tag] = { 'stamp': stamp, 'hash' : hash, 'date' : datetime.datetime.fromtimestamp(stamp).strftime('%Y-%m-%d'), 'commits': 0, 'authors': {} }
 
 		# collect info on tags, starting from latest
 		tags_sorted_by_date_desc = map(lambda el : el[1], reversed(sorted(map(lambda el : (el[1]['date'], el[0]), self.tags.items()))))
 		prev = None
 		for tag in reversed(tags_sorted_by_date_desc):
-			cmd = 'git shortlog -s "%s"' % tag
-			if prev != None:
-				cmd += ' "^%s"' % prev
-			output = getpipeoutput([cmd])
-			if len(output) == 0:
-				continue
-			prev = tag
-			for line in output.split('\n'):
-				parts = re.split('\s+', line, 2)
-				commits = int(parts[1])
-				author = parts[2]
-				self.tags[tag]['commits'] += commits
-				self.tags[tag]['authors'][author] = commits
+			if vcs == 'svn':
+				authors = svn_tags_xml_log[tag].xpathEval("//author")
+				commits = len(authors)
+
+				for authornode in authors:
+					author = authornode.content
+					try: 
+						self.tags[tag]['authors'][author] += 1
+					except KeyError:
+						self.tags[tag]['authors'][author] = 1
+
+			else:
+				cmd = 'git shortlog -s "%s"' % tag
+				if prev != None:
+					cmd += ' "^%s"' % prev
+				output = getpipeoutput([cmd])
+				if len(output) == 0:
+					continue
+				prev = tag
+				for line in output.split('\n'):
+					parts = re.split('\s+', line, 2)
+					commits = int(parts[1])
+					author = parts[2]
+					self.tags[tag]['commits'] += commits
+					self.tags[tag]['authors'][author] = commits
 
 		# Collect revision statistics
-		# Outputs "<stamp> <date> <time> <timezone> <author> '<' <mail> '>'"
-		lines = getpipeoutput(['git rev-list --pretty=format:"%%at %%ai %%aN <%%aE>" %s' % getcommitrange('HEAD'), 'grep -v ^commit']).split('\n')
+		if vcs == 'svn':
+			lines = svn_xml_log.xpathEval('//logentry')
+		else:
+			# Outputs "<stamp> <date> <time> <timezone> <author> '<' <mail> '>'"
+			lines = getpipeoutput(['git rev-list --pretty=format:"%%at %%ai %%aN <%%aE>" %s' % getcommitrange('HEAD'), 'grep -v ^commit']).split('\n')
 		for line in lines:
-			parts = line.split(' ', 4)
-			author = ''
-			try:
-				stamp = int(parts[0])
-			except ValueError:
-				stamp = 0
-			timezone = parts[3]
-			author, mail = parts[4].split('<', 1)
-			author = author.rstrip()
-			mail = mail.rstrip('>')
-			domain = '?'
-			if mail.find('@') != -1:
-				domain = mail.rsplit('@', 1)[1]
-			date = datetime.datetime.fromtimestamp(float(stamp))
+			if vcs == 'svn':
+				timezone = '+0000'
+				domain = '?' # svn doesn't provide email at all orz
+
+				line = line.children
+				while line:
+					if line.name == 'author':
+						author = line.content
+					elif line.name == 'date':
+						date = datetime.datetime.strptime(line.content,  "%Y-%m-%dT%H:%M:%S.%fZ")
+						stamp = float(date.strftime("%s"))
+					line=line.next
+			else:
+				parts = line.split(' ', 4)
+				author = ''
+				try:
+					stamp = int(parts[0])
+				except ValueError:
+					stamp = 0
+				timezone = parts[3]
+				author, mail = parts[4].split('<', 1)
+				author = author.rstrip()
+				mail = mail.rstrip('>')
+				domain = '?'
+				if mail.find('@') != -1:
+					domain = mail.rsplit('@', 1)[1]
+				date = datetime.datetime.fromtimestamp(float(stamp))
+
 
 			# First and last commit stamp
 			if self.last_commit_stamp == 0:
@@ -349,13 +441,33 @@ class GitDataCollector(DataCollector):
 
 		# TODO Optimize this, it's the worst bottleneck
 		# outputs "<stamp> <files>" for each revision
+
 		self.files_by_stamp = {} # stamp -> files
-		revlines = getpipeoutput(['git rev-list --pretty=format:"%%at %%T" %s' % getcommitrange('HEAD'), 'grep -v ^commit']).strip().split('\n')
-		lines = []
-		for revline in revlines:
-			time, rev = revline.split(' ')
-			linecount = self.getFilesInCommit(rev)
-			lines.append('%d %d' % (int(time), linecount))
+		if vcs == 'svn':
+			revlines = svn_xml_log.xpathEval('//logentry')
+			lines = []
+
+			for revline in revlines:
+				linecount = 0
+				revline = revline.children
+				while revline:
+					if revline.name == 'date':
+						stamp = float(datetime.datetime.strptime(revline.content, "%Y-%m-%dT%H:%M:%S.%fZ").strftime("%s"))
+					if revline.name == 'paths':
+						path = revline.children
+						while path:
+							if path.name == 'path':
+								linecount += 1
+							path = path.next
+					revline = revline.next
+				lines.append('%d %d' % (stamp, linecount))
+		else:
+			revlines = getpipeoutput(['git rev-list --pretty=format:"%%at %%T" %s' % getcommitrange('HEAD'), 'grep -v ^commit']).strip().split('\n')
+			lines = []
+			for revline in revlines:
+				time, rev = revline.split(' ')
+				linecount = self.getFilesInCommit(rev)
+				lines.append('%d %d' % (int(time), linecount))
 
 		self.total_commits = len(lines)
 		for line in lines:
@@ -370,38 +482,77 @@ class GitDataCollector(DataCollector):
 
 		# extensions
 		self.extensions = {} # extension -> files, lines
-		lines = getpipeoutput(['git ls-tree -r -z %s' % getcommitrange('HEAD', end_only = True)]).split('\000')
-		self.total_files = len(lines)
-		for line in lines:
-			if len(line) == 0:
-				continue
-			parts = re.split('\s+', line, 4)
-			sha1 = parts[2]
-			filename = parts[3]
 
-			if filename.find('.') == -1 or filename.rfind('.') == 0:
-				ext = ''
-			else:
-				ext = filename[(filename.rfind('.') + 1):]
-			if len(ext) > conf['max_ext_length']:
-				ext = ''
+		if vcs == 'svn':
+			svn_xml_status_text = getpipeoutput(['svn status -v --xml'])
+			svn_xml_status_parsed = libxml2.parseDoc(svn_xml_status_text)
+			svn_xml_status = svn_xml_status_parsed.xpathNewContext()
+			lines = svn_xml_status.xpathEval('//entry')
+			self.total_files = len(lines)
+			svn_total_lines = 0
+			for line in lines:
+				filename = line.prop("path")
 
-			if ext not in self.extensions:
-				self.extensions[ext] = {'files': 0, 'lines': 0}
+				if filename.find('.') == -1 or filename.rfind('.') == 0:
+					ext = ''
+				else:
+					ext = filename[(filename.rfind('.') + 1):]
+				if len(ext) > conf['max_ext_length']:
+					ext = ''
 
-			self.extensions[ext]['files'] += 1
-			try:
-				self.extensions[ext]['lines'] += self.getLinesInBlob(sha1)
-			except:
-				print 'Warning: Could not count lines for file "%s"' % line
+				if ext not in self.extensions:
+					self.extensions[ext] = {'files': 0, 'lines': 0}
+
+				self.extensions[ext]['files'] += 1
+				try:
+					lines = int(getpipeoutput(['cat %s' % filename, 'wc -l']))
+					self.extensions[ext]['lines'] += lines
+					svn_total_lines += lines
+				except:
+					print 'Warning: Could not count lines for file "%s"' % filename
+		else:
+			lines = getpipeoutput(['git ls-tree -r -z %s' % getcommitrange('HEAD', end_only = True)]).split('\000')
+			self.total_files = len(lines)
+			for line in lines:
+				if len(line) == 0:
+					continue
+				parts = re.split('\s+', line, 4)
+				sha1 = parts[2]
+				filename = parts[3]
+
+				if filename.find('.') == -1 or filename.rfind('.') == 0:
+					ext = ''
+				else:
+					ext = filename[(filename.rfind('.') + 1):]
+				if len(ext) > conf['max_ext_length']:
+					ext = ''
+
+				if ext not in self.extensions:
+					self.extensions[ext] = {'files': 0, 'lines': 0}
+
+				self.extensions[ext]['files'] += 1
+				try:
+					self.extensions[ext]['lines'] += self.getLinesInBlob(sha1)
+				except:
+					print 'Warning: Could not count lines for file "%s"' % line
 
 		# line statistics
 		# outputs:
 		#  N files changed, N insertions (+), N deletions(-)
 		# <stamp> <author>
 		self.changes_by_date = {} # stamp -> { files, ins, del }
-		lines = getpipeoutput(['git log --shortstat --pretty=format:"%%at %%aN" %s' % getcommitrange('HEAD')]).split('\n')
-		lines.reverse()
+		if vcs == 'svn':
+			# FIXME: implemented needed. dummy information added here.
+			print "line statistics is not implemented with svn"
+			lines = [];
+			for author in svn_authors_list:
+				self.authors[author]['lines_added'] = 0
+				self.authors[author]['lines_removed'] = 0
+			total_lines_added, total_lines_removed = 0, 0
+
+		else:
+			lines = getpipeoutput(['git log --shortstat --pretty=format:"%%at %%aN" %s' % getcommitrange('HEAD')]).split('\n')
+			lines.reverse()
 		files = 0; inserted = 0; deleted = 0; total_lines = 0
 		author = None
 		for line in lines:
@@ -436,7 +587,24 @@ class GitDataCollector(DataCollector):
 					print 'Warning: failed to handle line "%s"' % line
 					(files, inserted, deleted) = (0, 0, 0)
 				#self.changes_by_date[stamp] = { 'files': files, 'ins': inserted, 'del': deleted }
-		self.total_lines = total_lines
+		
+
+		# FIXME: dirty fix
+		if vcs == 'svn':
+			self.total_lines = svn_total_lines
+		else:
+			self.total_lines = total_lines
+
+		# if vcs == 'svn', free XMLs
+		if vcs == 'svn':
+			svn_xml_log.xpathFreeContext()
+			svn_xml_log_parsed.freeDoc()
+			svn_xml_status.xpathFreeContext()
+			svn_xml_status_parsed.freeDoc()
+			for tag in svn_tags_xml_log:
+				svn_tags_xml_log[tag].xpathFreeContext()
+				svn_tags_xml_log_parsed[tag].freeDoc()
+			
 	
 	def refine(self):
 		# authors
@@ -1143,7 +1311,10 @@ Default config values:
 			print 'FATAL: Output path is not a directory or does not exist'
 			sys.exit(1)
 
-		print 'Git path: %s' % gitpath
+		if conf['vcs'] == 'svn':
+			print 'Subversion path: %s' % gitpath
+		else:
+			print 'Git path: %s' % gitpath
 		print 'Output path: %s' % outputpath
 
 		os.chdir(gitpath)
@@ -1151,9 +1322,9 @@ Default config values:
 		cachefile = os.path.join(outputpath, 'gitstats.cache')
 
 		print 'Collecting data...'
-		data = GitDataCollector()
+		data = RepoDataCollector()
 		data.loadCache(cachefile)
-		data.collect(gitpath)
+		data.collect(gitpath, conf['vcs'])
 		print 'Refining data...'
 		data.saveCache(cachefile)
 		data.refine()
