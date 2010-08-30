@@ -91,6 +91,16 @@ def getversion():
 	if VERSION == 0:
 		VERSION = getpipeoutput(["git rev-parse --short %s" % getcommitrange('HEAD')]).split('\n')[0]
 	return VERSION
+	
+# line counter http://stackoverflow.com/questions/845058/how-to-get-line-count-cheaply-in-python
+def line_counter(fname):
+	try:
+		with open(fname) as f:
+			for i, l in enumerate(f):
+				pass
+		return i + 1
+	except:
+		return -1
 
 class DataCollector:
 	"""Manages data collection from a revision control repository."""
@@ -490,8 +500,17 @@ class RepoDataCollector(DataCollector):
 			lines = svn_xml_status.xpathEval('//entry')
 			self.total_files = len(lines)
 			svn_total_lines = 0
+			
+
 			for line in lines:
 				filename = line.prop("path")
+				lines = line_counter(filename)
+				
+				# it is not a file but a directory or so
+				if lines == -1:
+					self.total_files -= 1
+					continue
+
 
 				if filename.find('.') == -1 or filename.rfind('.') == 0:
 					ext = ''
@@ -504,12 +523,9 @@ class RepoDataCollector(DataCollector):
 					self.extensions[ext] = {'files': 0, 'lines': 0}
 
 				self.extensions[ext]['files'] += 1
-				try:
-					lines = int(getpipeoutput(['cat %s' % filename, 'wc -l']))
-					self.extensions[ext]['lines'] += lines
-					svn_total_lines += lines
-				except:
-					print 'Warning: Could not count lines for file "%s"' % filename
+				self.extensions[ext]['lines'] += lines
+				svn_total_lines += lines
+
 		else:
 			lines = getpipeoutput(['git ls-tree -r -z %s' % getcommitrange('HEAD', end_only = True)]).split('\000')
 			self.total_files = len(lines)
